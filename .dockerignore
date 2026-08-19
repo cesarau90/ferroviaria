@@ -1,0 +1,8 @@
+node_modules
+dist
+dist-server
+railguard.db*
+.git
+.github
+.env
+*.log

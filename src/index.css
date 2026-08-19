@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base { body { @apply m-0 bg-slate-950 text-slate-100 font-sans antialiased; } button,input,select { font: inherit; } }
+@layer components {
+  .panel { @apply rounded-xl border border-slate-700/70 bg-slate-900/80 shadow-xl shadow-black/10; }
+  .panel-pad { @apply panel p-5; }
+  .label { @apply text-[11px] uppercase tracking-[.16em] text-slate-400 font-semibold; }
+  .input { @apply mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm outline-none transition focus:border-cyan-400; }
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2.5 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40; }
+  .btn-primary { @apply btn bg-cyan-500 text-slate-950 hover:bg-cyan-400; }
+  .btn-muted { @apply btn border border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700; }
+  .badge { @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[10px] font-bold tracking-wider; }
+}
+.leaflet-container { height:100%; width:100%; background:#0f172a; font-family:inherit; }

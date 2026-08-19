@@ -1,0 +1,15 @@
+# Dependencies and generated builds
+node_modules/
+dist/
+dist-server/
+
+# Local demo database (created and seeded automatically by the server)
+railguard.db
+railguard.db-*
+
+# Local tooling and secrets
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
