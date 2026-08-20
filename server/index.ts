@@ -171,9 +171,16 @@ app.post('/api/trips', token, allow('ADMIN', 'OPERATOR'), (req, res) => {
   const free = db.prepare('SELECT w.id wagonId,d.id deviceId FROM wagons w JOIN devices d ON d.id=w.id WHERE w.id NOT IN (SELECT wagon_id FROM trip_wagons)').all() as any[]
   if (free.length < count) return res.status(400).json({ message: 'No hay vagones/dispositivos disponibles suficientes.' })
   const next = (db.prepare('SELECT count(*) c FROM trips').get() as any).c + 1
-  const trip = db.prepare('INSERT INTO trips (code,origin,destination,product,departure,origin_lat,origin_lng,dest_lat,dest_lng,geofence_radius,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(`TRIP-2026-${String(next).padStart(3,'0')}`, b.origin, b.destination, b.product || 'Pellet', b.departure, originLat, originLng, destLat, destLng, radius, 'PLANNED', iso())
-  for (const pair of free.slice(0,count)) db.prepare('INSERT INTO trip_wagons (trip_id,wagon_id,device_id,latitude,longitude,speed,battery,lock_status,door_status,tamper,online,off_route,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(trip.lastInsertRowid,pair.wagonId,pair.deviceId,originLat,originLng,0,90,'LOCKED','CLOSED',0,1,0,iso())
-  audit((req as any).user.id,'TRIP_CREATED',Number(trip.lastInsertRowid),null,'SUCCESS'); res.status(201).json({ id: trip.lastInsertRowid })
+  db.exec('BEGIN')
+  try {
+    const trip = db.prepare('INSERT INTO trips (code,origin,destination,product,departure,origin_lat,origin_lng,dest_lat,dest_lng,geofence_radius,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(`TRIP-2026-${String(next).padStart(3,'0')}`, b.origin, b.destination, b.product || 'Pellet', b.departure, originLat, originLng, destLat, destLng, radius, 'PLANNED', iso())
+    for (const pair of free.slice(0,count)) db.prepare('INSERT INTO trip_wagons (trip_id,wagon_id,device_id,latitude,longitude,speed,battery,lock_status,door_status,tamper,online,off_route,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(trip.lastInsertRowid,pair.wagonId,pair.deviceId,originLat,originLng,0,90,'LOCKED','CLOSED',0,1,0,iso())
+    db.exec('COMMIT')
+    audit((req as any).user.id,'TRIP_CREATED',Number(trip.lastInsertRowid),null,'SUCCESS'); res.status(201).json({ id: trip.lastInsertRowid })
+  } catch {
+    db.exec('ROLLBACK')
+    res.status(500).json({ message: 'No se pudo crear el viaje. Intenta nuevamente.' })
+  }
 })
 app.get('/api/trips/:id', token, (req,res) => { const tripId=Number(req.params.id); const trip = db.prepare('SELECT * FROM trips WHERE id=?').get(tripId); if (!trip) return res.status(404).json({message:'Trip not found'}); const wagons = db.prepare('SELECT id FROM trip_wagons WHERE trip_id=?').all(tripId).map((x:any) => wagonData(wagonRow(x.id)!)); res.json({ trip, wagons, events: db.prepare('SELECT * FROM audit_logs WHERE trip_id=? ORDER BY id DESC LIMIT 20').all(tripId) }) })
 app.post('/api/trips/:id/start', token, allow('ADMIN','OPERATOR'), (req,res) => {
