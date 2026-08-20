@@ -7,6 +7,10 @@ import jwt from 'jsonwebtoken'
 import { Server } from 'socket.io'
 
 const PORT = Number(process.env.PORT || 3001)
+const isProduction = process.env.NODE_ENV === 'production'
+if (isProduction && !process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET must be set via environment variable in production. Refusing to start with an insecure default.')
+}
 const JWT_SECRET = process.env.JWT_SECRET || 'railguard-demo-local-secret'
 const DB_PATH = process.env.DATABASE_PATH || 'railguard.db'
 const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(',').map(origin => origin.trim())
@@ -93,9 +97,26 @@ function evaluate(w: Wagon) {
   if (w.off_route) alertFor(w.trip_id, w.id, 'OFF_ROUTE', 'WARNING', `${w.wagon_code}: fuera de la ruta esperada`); else resolveAlert(w.id, 'OFF_ROUTE')
 }
 
+const LOGIN_MAX_ATTEMPTS = 5
+const LOGIN_LOCK_MS = 10 * 60 * 1000
+const loginAttempts = new Map<string, { count: number; lockedUntil: number }>()
 app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body || {}; const user = db.prepare('SELECT * FROM users WHERE email=?').get(email) as any
-  if (!user || !bcrypt.compareSync(password || '', user.password_hash)) return res.status(401).json({ message: 'Correo o contraseña incorrectos' })
+  const { email, password } = req.body || {}
+  const key = String(email || '').trim().toLowerCase()
+  const attempt = loginAttempts.get(key)
+  if (attempt && attempt.lockedUntil > Date.now()) {
+    audit(null, 'LOGIN_FAILED', null, null, 'DENIED', `Bloqueado temporalmente por intentos fallidos: ${key}`)
+    return res.status(429).json({ message: 'Demasiados intentos fallidos. Intenta nuevamente en unos minutos.' })
+  }
+  const user = db.prepare('SELECT * FROM users WHERE email=?').get(email) as any
+  if (!user || !bcrypt.compareSync(password || '', user.password_hash)) {
+    const next = { count: (attempt?.count || 0) + 1, lockedUntil: attempt?.lockedUntil || 0 }
+    if (next.count >= LOGIN_MAX_ATTEMPTS) { next.lockedUntil = Date.now() + LOGIN_LOCK_MS; next.count = 0 }
+    loginAttempts.set(key, next)
+    audit(null, 'LOGIN_FAILED', null, null, 'DENIED', `Credenciales inválidas: ${key}`)
+    return res.status(401).json({ message: 'Correo o contraseña incorrectos' })
+  }
+  loginAttempts.delete(key)
   const safe = { id: user.id, email: user.email, role: user.role, name: user.name } as UserToken
   audit(user.id, 'LOGIN', null, null, 'SUCCESS'); res.json({ token: jwt.sign(safe, JWT_SECRET, { expiresIn: '8h' }), user: safe })
 })
@@ -197,13 +218,16 @@ function unlockChecks(w: Wagon, user: UserToken) {
   return errors
 }
 app.post('/api/wagons/:id/request-unlock', token, (req,res) => { const w = wagonRow(Number(req.params.id)), user=(req as any).user as UserToken; if(!w) return res.status(404).json({message:'Wagon not found'}); const errors=unlockChecks(w,user); audit(user.id,'UNLOCK_REQUESTED',w.trip_id,w.id,errors.length?'DENIED':'PENDING',errors.join(' ')); if(errors.length) { io.emit('audit:new',{action:'UNLOCK_DENIED',wagonId:w.wagon_code,reason:errors.join(' ')}); return res.status(400).json({authorized:false,errors}) } const unlockToken=`req_${crypto.randomUUID()}`; db.prepare('INSERT INTO unlock_requests (token,trip_wagon_id,user_id,created_at) VALUES (?,?,?,?)').run(unlockToken,w.id,user.id,iso()); res.json({authorized:true,unlockToken,wagonId:w.wagon_code,tripCode:w.trip_code,location:'Zona autorizada'}) })
+const UNLOCK_TOKEN_TTL_MS = 5 * 60 * 1000
 app.post('/api/wagons/:id/confirm-unlock', token, (req,res) => {
   const { unlockToken, code } = req.body || {}, user=(req as any).user as UserToken, w=wagonRow(Number(req.params.id)); if(!w) return res.status(404).json({message:'Wagon not found'})
-  const request = db.prepare('SELECT * FROM unlock_requests WHERE token=? AND trip_wagon_id=? AND user_id=?').get(unlockToken,w.id,user.id)
+  const request = db.prepare('SELECT * FROM unlock_requests WHERE token=? AND trip_wagon_id=? AND user_id=?').get(unlockToken,w.id,user.id) as any
+  if(!request) { audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED','Unlock token not found or already used'); return res.status(400).json({message:'La solicitud de desbloqueo no existe o ya fue utilizada.'}) }
+  if(Date.now()-new Date(request.created_at).getTime()>UNLOCK_TOKEN_TTL_MS) { db.prepare('DELETE FROM unlock_requests WHERE id=?').run(request.id); audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED','Unlock token expired'); return res.status(400).json({message:'La solicitud de desbloqueo expiró. Solicita un nuevo desbloqueo.'}) }
   // DEMO ONLY - Replace with real MFA/TOTP provider in production.
-  if(!request || code !== '123456') { audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED','MFA demo code invalid'); return res.status(400).json({message:'Código de segundo factor inválido.'}) }
+  if(code !== '123456') { audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED','MFA demo code invalid'); return res.status(400).json({message:'Código de segundo factor inválido.'}) }
   const errors = unlockChecks(w,user); if(errors.length) { audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED',errors.join(' ')); return res.status(400).json({message:'Las condiciones de seguridad cambiaron.',errors}) }
-  db.prepare("UPDATE trip_wagons SET lock_status='UNLOCKED' WHERE id=?").run(w.id); db.prepare('DELETE FROM unlock_requests WHERE id=?').run((request as any).id); audit(user.id,'UNLOCK_AUTHORIZED',w.trip_id,w.id,'SUCCESS','Unlock authorized by MFA'); const updated=wagonData(wagonRow(w.id)!); io.emit('wagon:status',updated); io.emit('unlock:status',{wagonId:w.id,status:'UNLOCKED'}); res.json({ok:true,wagon:updated})
+  db.prepare("UPDATE trip_wagons SET lock_status='UNLOCKED' WHERE id=?").run(w.id); db.prepare('DELETE FROM unlock_requests WHERE id=?').run(request.id); audit(user.id,'UNLOCK_AUTHORIZED',w.trip_id,w.id,'SUCCESS','Unlock authorized by MFA'); const updated=wagonData(wagonRow(w.id)!); io.emit('wagon:status',updated); io.emit('unlock:status',{wagonId:w.id,status:'UNLOCKED'}); res.json({ok:true,wagon:updated})
 })
 app.get('/api/alerts', token, (_req,res) => res.json(db.prepare(`SELECT a.*,w.code wagon_code,d.code device_code,t.code trip_code FROM alerts a LEFT JOIN trip_wagons tw ON tw.id=a.trip_wagon_id LEFT JOIN wagons w ON w.id=tw.wagon_id LEFT JOIN devices d ON d.id=tw.device_id LEFT JOIN trips t ON t.id=a.trip_id ORDER BY a.id DESC LIMIT 100`).all()))
 app.post('/api/alerts/:id/acknowledge', token, allow('ADMIN','OPERATOR'), (req,res) => { const alertId=Number(req.params.id); db.prepare("UPDATE alerts SET status='ACKNOWLEDGED' WHERE id=?").run(alertId); audit((req as any).user.id,'ALERT_ACKNOWLEDGED',null,null,'SUCCESS',`Alert ${alertId}`); io.emit('alert:update',{id:alertId,status:'ACKNOWLEDGED'}); res.json({ok:true}) })
@@ -220,5 +244,11 @@ setInterval(() => {
   }
 }, 3000)
 
+io.use((socket, next) => {
+  const raw = socket.handshake.auth?.token
+  if (!raw) return next(new Error('Authentication required'))
+  try { jwt.verify(raw, JWT_SECRET); next() }
+  catch { next(new Error('Invalid session')) }
+})
 io.on('connection', socket => socket.emit('system:connected',{at:iso()}))
 httpServer.listen(PORT, () => console.log(`RailGuard API listening on http://localhost:${PORT}`))
