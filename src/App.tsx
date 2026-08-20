@@ -394,27 +394,33 @@ function Sparkline({data,color}:{data:number[];color:string}){
   return <svg viewBox={`0 0 ${w} ${h}`} className="h-10 w-full" preserveAspectRatio="none"><polyline points={points} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round"/></svg>
 }
 function AssetList({devices=false,user}:{devices?:boolean;user:User}){
+  const [trips,setTrips]=useState<Trip[]>([])
   const [trip,setTrip]=useState<Trip>(),[wagons,setWagons]=useState<Wagon[]>([]),[loading,setLoading]=useState(true)
   const [search,setSearch]=useState(''),[filter,setFilter]=useState('ALL')
   const [selected,setSelected]=useState<Wagon|null>(null)
-  const load=()=>request<Trip[]>('/trips').then(async trips=>{const current=trips.find(t=>t.status==='ACTIVE'||t.status==='ARRIVED');if(!current){setLoading(false);return}setTrip(current);const assets=await request<Wagon[]>(`/trips/${current.id}/wagons`);setWagons(assets);setLoading(false)}).catch(()=>setLoading(false))
   useEffect(()=>{
-    void load()
-    const refresh=()=>void load()
-    socket.on('wagon:status',refresh); socket.on('telemetry:update',refresh)
-    return ()=>{socket.off('wagon:status',refresh);socket.off('telemetry:update',refresh)}
+    const loadTrips=()=>request<Trip[]>('/trips').then(list=>{setTrips(list);setTrip(prev=>prev?(list.find(t=>t.id===prev.id)||prev):(list.find(t=>t.status==='ACTIVE'||t.status==='ARRIVED')||list[0]));setLoading(false)}).catch(()=>setLoading(false))
+    loadTrips()
+    socket.on('trip:status',loadTrips); socket.on('trip:position',loadTrips)
+    return ()=>{socket.off('trip:status',loadTrips);socket.off('trip:position',loadTrips)}
   },[])
+  const loadWagons=()=>{if(!trip)return;request<Wagon[]>(`/trips/${trip.id}/wagons`).then(setWagons).catch(()=>{})}
+  useEffect(()=>{
+    loadWagons()
+    socket.on('wagon:status',loadWagons); socket.on('telemetry:update',loadWagons)
+    return ()=>{socket.off('wagon:status',loadWagons);socket.off('telemetry:update',loadWagons)}
+  },[trip?.id])
   const title=devices?'Dispositivos IoT':'Vagones monitoreados'
-  const subtitle=devices?'Estado de conectividad, batería y telemetría de cada dispositivo.':'Inventario operativo de los vagones asignados al viaje activo.'
+  const subtitle=devices?'Estado de conectividad, batería y telemetría de cada dispositivo.':'Inventario operativo de los vagones asignados al viaje seleccionado.'
   if(loading)return <div className="h-96 animate-pulse rounded-xl bg-slate-800"/>
-  if(!trip)return <Empty icon={devices?<Cpu/>:<Box/>} text={devices?'No hay dispositivos asociados a viajes activos.':'No hay vagones asociados a viajes activos.'}/>
+  if(!trip)return <Empty icon={devices?<Cpu/>:<Box/>} text="No hay viajes registrados en el sistema."/>
   const filtered=wagons.filter(w=>(filter==='ALL'||(filter==='OFFLINE'?!w.online:w.status===filter)) && (search.trim()===''||`${w.wagonId} ${w.deviceId}`.toLowerCase().includes(search.trim().toLowerCase())))
   return <>
     <PageTitle action={<NavLink to={`/trips/${trip.id}`} className="btn-muted"><MapIcon size={16}/>Abrir Control Center</NavLink>}><p className="label">Inventario operativo</p><h1 className="mt-1 text-2xl font-bold">{title}</h1><p className="mt-1 text-sm text-slate-400">{subtitle}</p></PageTitle>
     <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label={devices?'Dispositivos activos':'Vagones activos'} value={String(wagons.length)} icon={devices?<Cpu/>:<Box/>}/><Metric label="En línea" value={String(wagons.filter(w=>w.online).length)} icon={<Wifi/>}/><Metric label="Advertencias" value={String(wagons.filter(w=>w.status==='WARNING').length)} icon={<AlertTriangle/>}/><Metric label="Críticos" value={String(wagons.filter(w=>w.status==='CRITICAL').length)} icon={<ShieldCheck/>}/></div>
     <section className="panel overflow-x-auto">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 p-4">
-        <p className="text-sm font-semibold">{trip.code} · {trip.origin} → {trip.destination}</p>
+        <select value={trip.id} onChange={e=>setTrip(trips.find(t=>t.id===Number(e.target.value)))} className="input w-auto normal-case tracking-normal">{trips.map(t=><option key={t.id} value={t.id}>{t.code} · {t.origin} → {t.destination} ({label(t.status)})</option>)}</select>
         <div className="flex flex-wrap items-center gap-2">
           <input value={search} onChange={e=>setSearch(e.target.value)} placeholder={devices?'Buscar dispositivo…':'Buscar vagón…'} className="input w-44 normal-case tracking-normal"/>
           <div className="flex flex-wrap gap-1">{['ALL','ONLINE','WARNING','CRITICAL','OFFLINE'].map(f=><button onClick={()=>setFilter(f)} key={f} className={`rounded px-2 py-1 text-[10px] font-bold ${filter===f?'bg-cyan-400 text-slate-950':'bg-slate-800 text-slate-400'}`}>{f==='ALL'?'TODOS':label(f)}</button>)}</div>
@@ -423,7 +429,7 @@ function AssetList({devices=false,user}:{devices?:boolean;user:User}){
       {filtered.length===0?<div className="p-8"><Empty icon={devices?<Cpu/>:<Box/>} text="Ningún resultado coincide con la búsqueda o el filtro."/></div>:
       <table className="w-full text-left text-sm"><thead className="border-b border-slate-800 bg-slate-900 text-[10px] uppercase tracking-wider text-slate-500"><tr><th className="p-4">{devices?'Dispositivo':'Vagón'}</th><th className="p-4">{devices?'Vagón asignado':'Dispositivo IoT'}</th><th className="p-4">Estado</th><th className="p-4">Batería</th><th className="p-4">Seguridad</th><th className="p-4">Ubicación</th><th className="p-4">Última comunicación</th></tr></thead><tbody>{filtered.map(w=><tr key={w.id} onClick={()=>setSelected(w)} className="cursor-pointer border-b border-slate-800/70 transition hover:bg-slate-900/70"><td className="p-4 font-semibold text-cyan-300">{devices?w.deviceId:w.wagonId}</td><td className="p-4 text-slate-300">{devices?w.wagonId:w.deviceId}</td><td className="p-4"><Badge value={w.status}/></td><td className="p-4"><span className={w.battery<20?'font-bold text-amber-300':''}>{w.battery}%</span></td><td className="p-4 text-xs"><span className={w.tamper||w.doorStatus==='OPEN'?'text-red-300':'text-emerald-300'}>{w.tamper?'MANIPULACIÓN':`${label(w.lockStatus)} · ${label(w.doorStatus)}`}</span></td><td className="p-4"><span className={`text-xs ${w.geofence==='INSIDE_GEOFENCE'?'text-emerald-300':'text-slate-400'}`}>{w.geofence==='INSIDE_GEOFENCE'?'Zona autorizada':'En ruta'}</span></td><td className="p-4 text-xs text-slate-400">{formatTime(w.lastSeen)}</td></tr>)}</tbody></table>}
     </section>
-    {selected&&<WagonDrawer wagon={selected} trip={trip} user={user} close={()=>setSelected(null)} refresh={load}/>}
+    {selected&&<WagonDrawer wagon={selected} trip={trip} user={user} close={()=>setSelected(null)} refresh={loadWagons}/>}
   </>
 }
 function Wagons({user}:{user:User}){return <AssetList user={user}/>}
