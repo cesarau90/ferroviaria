@@ -100,6 +100,20 @@ app.post('/api/auth/login', (req, res) => {
   audit(user.id, 'LOGIN', null, null, 'SUCCESS'); res.json({ token: jwt.sign(safe, JWT_SECRET, { expiresIn: '8h' }), user: safe })
 })
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'railguard-api', timestamp: iso() }))
+const GEOCODE_USER_AGENT = 'RailGuard-Demo/1.0 (+https://github.com/cesarau90/ferroviaria)'
+app.get('/api/geocode', token, async (req, res) => {
+  const q = String(req.query.q || '').trim()
+  if (q.length < 3) return res.json([])
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&accept-language=es&q=${encodeURIComponent(q)}`
+    const upstream = await fetch(url, { headers: { 'User-Agent': GEOCODE_USER_AGENT } })
+    if (!upstream.ok) return res.status(502).json({ message: 'El servicio de ubicaciones no respondió correctamente.' })
+    const results = await upstream.json() as any[]
+    res.json(results.slice(0, 5).map(r => ({ label: r.display_name as string, lat: Number(r.lat), lng: Number(r.lon) })))
+  } catch {
+    res.status(502).json({ message: 'No se pudo consultar el servicio de ubicaciones. Intenta nuevamente.' })
+  }
+})
 app.get('/api/dashboard', token, (_req, res) => {
   const wagons = db.prepare("SELECT tw.*,t.dest_lat,t.dest_lng,t.geofence_radius FROM trip_wagons tw JOIN trips t ON t.id=tw.trip_id WHERE t.status='ACTIVE'").all() as Wagon[]
   const activeAlerts = (db.prepare("SELECT count(*) c FROM alerts WHERE status='ACTIVE'").get() as any).c
@@ -107,11 +121,24 @@ app.get('/api/dashboard', token, (_req, res) => {
 })
 app.get('/api/trips', token, (_req, res) => res.json(db.prepare('SELECT t.*,count(tw.id) wagon_count FROM trips t LEFT JOIN trip_wagons tw ON tw.trip_id=t.id GROUP BY t.id ORDER BY t.id DESC').all()))
 app.post('/api/trips', token, allow('ADMIN', 'OPERATOR'), (req, res) => {
-  const b = req.body; const count = Math.max(1, Math.min(30, Number(b.wagonCount || 1))); const next = (db.prepare('SELECT count(*) c FROM trips').get() as any).c + 1
-  const trip = db.prepare('INSERT INTO trips (code,origin,destination,product,departure,origin_lat,origin_lng,dest_lat,dest_lng,geofence_radius,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(`TRIP-2026-${String(next).padStart(3,'0')}`, b.origin, b.destination, b.product || 'Pellet', b.departure || iso(), Number(b.originLat), Number(b.originLng), Number(b.destLat), Number(b.destLng), Number(b.radius || 1500), 'PLANNED', iso())
+  const b = req.body || {}
+  const originLat = Number(b.originLat), originLng = Number(b.originLng), destLat = Number(b.destLat), destLng = Number(b.destLng)
+  const radius = Number(b.radius), wagonCount = Number(b.wagonCount)
+  const errors: string[] = []
+  if (!String(b.origin || '').trim()) errors.push('El origen es obligatorio.')
+  if (!String(b.destination || '').trim()) errors.push('El destino es obligatorio.')
+  if (!String(b.departure || '').trim()) errors.push('La fecha de salida es obligatoria.')
+  if (!Number.isFinite(originLat) || !Number.isFinite(originLng)) errors.push('Selecciona un origen válido desde las sugerencias.')
+  if (!Number.isFinite(destLat) || !Number.isFinite(destLng)) errors.push('Selecciona un destino válido desde las sugerencias.')
+  if (!Number.isFinite(radius) || radius <= 0) errors.push('El radio de geocerca debe ser un número positivo.')
+  if (!Number.isInteger(wagonCount) || wagonCount < 1) errors.push('La cantidad de vagones debe ser un entero positivo.')
+  if (errors.length) return res.status(400).json({ message: errors.join(' ') })
+  const count = Math.max(1, Math.min(30, wagonCount))
   const free = db.prepare('SELECT w.id wagonId,d.id deviceId FROM wagons w JOIN devices d ON d.id=w.id WHERE w.id NOT IN (SELECT wagon_id FROM trip_wagons)').all() as any[]
-  if (free.length < count) return res.status(400).json({ message: 'No hay vagones/dispositivos disponibles suficientes' })
-  for (const pair of free.slice(0,count)) db.prepare('INSERT INTO trip_wagons (trip_id,wagon_id,device_id,latitude,longitude,speed,battery,lock_status,door_status,tamper,online,off_route,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(trip.lastInsertRowid,pair.wagonId,pair.deviceId,Number(b.originLat),Number(b.originLng),0,90,'LOCKED','CLOSED',0,1,0,iso())
+  if (free.length < count) return res.status(400).json({ message: 'No hay vagones/dispositivos disponibles suficientes.' })
+  const next = (db.prepare('SELECT count(*) c FROM trips').get() as any).c + 1
+  const trip = db.prepare('INSERT INTO trips (code,origin,destination,product,departure,origin_lat,origin_lng,dest_lat,dest_lng,geofence_radius,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(`TRIP-2026-${String(next).padStart(3,'0')}`, b.origin, b.destination, b.product || 'Pellet', b.departure, originLat, originLng, destLat, destLng, radius, 'PLANNED', iso())
+  for (const pair of free.slice(0,count)) db.prepare('INSERT INTO trip_wagons (trip_id,wagon_id,device_id,latitude,longitude,speed,battery,lock_status,door_status,tamper,online,off_route,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(trip.lastInsertRowid,pair.wagonId,pair.deviceId,originLat,originLng,0,90,'LOCKED','CLOSED',0,1,0,iso())
   audit((req as any).user.id,'TRIP_CREATED',Number(trip.lastInsertRowid),null,'SUCCESS'); res.status(201).json({ id: trip.lastInsertRowid })
 })
 app.get('/api/trips/:id', token, (req,res) => { const tripId=Number(req.params.id); const trip = db.prepare('SELECT * FROM trips WHERE id=?').get(tripId); if (!trip) return res.status(404).json({message:'Trip not found'}); const wagons = db.prepare('SELECT id FROM trip_wagons WHERE trip_id=?').all(tripId).map((x:any) => wagonData(wagonRow(x.id)!)); res.json({ trip, wagons, events: db.prepare('SELECT * FROM audit_logs WHERE trip_id=? ORDER BY id DESC LIMIT 20').all(tripId) }) })
