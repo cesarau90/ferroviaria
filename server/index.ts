@@ -146,10 +146,12 @@ app.get('/api/dashboard', token, (_req, res) => {
   })
 })
 app.get('/api/trips', token, (_req, res) => res.json(db.prepare('SELECT t.*,count(tw.id) wagon_count FROM trips t LEFT JOIN trip_wagons tw ON tw.trip_id=t.id GROUP BY t.id ORDER BY t.id DESC').all()))
+app.get('/api/wagons/available', token, (_req,res) => res.json(db.prepare('SELECT id, code FROM wagons WHERE id NOT IN (SELECT wagon_id FROM trip_wagons) ORDER BY id').all()))
+app.get('/api/devices/available', token, (_req,res) => res.json(db.prepare('SELECT id, code FROM devices WHERE id NOT IN (SELECT device_id FROM trip_wagons) ORDER BY id').all()))
 app.post('/api/trips', token, allow('ADMIN', 'OPERATOR'), (req, res) => {
   const b = req.body || {}
   const originLat = Number(b.originLat), originLng = Number(b.originLng), destLat = Number(b.destLat), destLng = Number(b.destLng)
-  const radius = Number(b.radius), wagonCount = Number(b.wagonCount)
+  const radius = Number(b.radius)
   const errors: string[] = []
   if (!String(b.origin || '').trim()) errors.push('El origen es obligatorio.')
   if (!String(b.destination || '').trim()) errors.push('El destino es obligatorio.')
@@ -157,20 +159,44 @@ app.post('/api/trips', token, allow('ADMIN', 'OPERATOR'), (req, res) => {
   if (!Number.isFinite(originLat) || !Number.isFinite(originLng)) errors.push('Selecciona un origen válido desde las sugerencias.')
   if (!Number.isFinite(destLat) || !Number.isFinite(destLng)) errors.push('Selecciona un destino válido desde las sugerencias.')
   if (!Number.isFinite(radius) || radius <= 0) errors.push('El radio de geocerca debe ser un número positivo.')
-  if (!Number.isInteger(wagonCount) || wagonCount < 1) errors.push('La cantidad de vagones debe ser un entero positivo.')
+
+  let assignments: { wagonId: number; deviceId: number }[] = []
+  if (Array.isArray(b.assignments) && b.assignments.length > 0) {
+    const seenWagons = new Set<number>(), seenDevices = new Set<number>()
+    for (const a of b.assignments) {
+      const wagonId = Number(a?.wagonId), deviceId = Number(a?.deviceId)
+      if (!Number.isInteger(wagonId) || !Number.isInteger(deviceId)) { errors.push('Selección de vagón o dispositivo inválida.'); continue }
+      if (seenWagons.has(wagonId)) errors.push(`El vagón ${wagonId} fue seleccionado más de una vez.`)
+      if (seenDevices.has(deviceId)) errors.push(`El dispositivo ${deviceId} fue seleccionado más de una vez.`)
+      seenWagons.add(wagonId); seenDevices.add(deviceId)
+      assignments.push({ wagonId, deviceId })
+    }
+    if (assignments.length > 30) errors.push('No se pueden asignar más de 30 vagones a un viaje.')
+  } else {
+    const wagonCount = Number(b.wagonCount)
+    if (!Number.isInteger(wagonCount) || wagonCount < 1) errors.push('La cantidad de vagones debe ser un entero positivo.')
+    else {
+      const count = Math.max(1, Math.min(30, wagonCount))
+      const free = db.prepare('SELECT w.id wagonId,d.id deviceId FROM wagons w JOIN devices d ON d.id=w.id WHERE w.id NOT IN (SELECT wagon_id FROM trip_wagons)').all() as any[]
+      if (free.length < count) errors.push('No hay vagones/dispositivos disponibles suficientes.')
+      else assignments = free.slice(0, count)
+    }
+  }
   if (errors.length) return res.status(400).json({ message: errors.join(' ') })
-  const count = Math.max(1, Math.min(30, wagonCount))
-  const free = db.prepare('SELECT w.id wagonId,d.id deviceId FROM wagons w JOIN devices d ON d.id=w.id WHERE w.id NOT IN (SELECT wagon_id FROM trip_wagons)').all() as any[]
-  if (free.length < count) return res.status(400).json({ message: 'No hay vagones/dispositivos disponibles suficientes.' })
+
   const next = (db.prepare('SELECT count(*) c FROM trips').get() as any).c + 1
   db.exec('BEGIN')
   try {
+    const freeWagonIds = new Set((db.prepare('SELECT id FROM wagons WHERE id NOT IN (SELECT wagon_id FROM trip_wagons)').all() as any[]).map(r => r.id))
+    const freeDeviceIds = new Set((db.prepare('SELECT id FROM devices WHERE id NOT IN (SELECT device_id FROM trip_wagons)').all() as any[]).map(r => r.id))
+    for (const a of assignments) if (!freeWagonIds.has(a.wagonId) || !freeDeviceIds.has(a.deviceId)) throw new Error('UNAVAILABLE')
     const trip = db.prepare('INSERT INTO trips (code,origin,destination,product,departure,origin_lat,origin_lng,dest_lat,dest_lng,geofence_radius,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(`TRIP-2026-${String(next).padStart(3,'0')}`, b.origin, b.destination, b.product || 'Pellet', b.departure, originLat, originLng, destLat, destLng, radius, 'PLANNED', iso())
-    for (const pair of free.slice(0,count)) db.prepare('INSERT INTO trip_wagons (trip_id,wagon_id,device_id,latitude,longitude,speed,battery,lock_status,door_status,tamper,online,off_route,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(trip.lastInsertRowid,pair.wagonId,pair.deviceId,originLat,originLng,0,90,'LOCKED','CLOSED',0,1,0,iso())
+    for (const a of assignments) db.prepare('INSERT INTO trip_wagons (trip_id,wagon_id,device_id,latitude,longitude,speed,battery,lock_status,door_status,tamper,online,off_route,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(trip.lastInsertRowid,a.wagonId,a.deviceId,originLat,originLng,0,90,'LOCKED','CLOSED',0,1,0,iso())
     db.exec('COMMIT')
     audit((req as any).user.id,'TRIP_CREATED',Number(trip.lastInsertRowid),null,'SUCCESS'); res.status(201).json({ id: trip.lastInsertRowid })
-  } catch {
+  } catch (err) {
     db.exec('ROLLBACK')
+    if (err instanceof Error && err.message === 'UNAVAILABLE') return res.status(409).json({ message: 'Uno de los vagones o dispositivos seleccionados ya no está disponible. Actualiza la lista e intenta nuevamente.' })
     res.status(500).json({ message: 'No se pudo crear el viaje. Intenta nuevamente.' })
   }
 })

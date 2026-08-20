@@ -125,6 +125,41 @@ describe('trips', () => {
     const after = await (await fetch(`${BASE}/trips`, { headers: { Authorization: `Bearer ${operatorToken}` } })).json() as any[]
     expect(after.length).toBe(before.length)
   })
+
+  it('creates a trip with manually chosen, arbitrarily paired wagon/device ids', async () => {
+    const [availableWagons, availableDevices] = await Promise.all([
+      (await fetch(`${BASE}/wagons/available`, { headers: { Authorization: `Bearer ${operatorToken}` } })).json() as Promise<any[]>,
+      (await fetch(`${BASE}/devices/available`, { headers: { Authorization: `Bearer ${operatorToken}` } })).json() as Promise<any[]>
+    ])
+    expect(availableWagons.length).toBeGreaterThanOrEqual(2)
+    // Deliberately pair each wagon with a DIFFERENT device's id, proving the
+    // pairing is no longer forced to match by id.
+    const assignments = [
+      { wagonId: availableWagons[0].id, deviceId: availableDevices[1].id },
+      { wagonId: availableWagons[1].id, deviceId: availableDevices[0].id }
+    ]
+    const { origin, destination, product, departure, originLat, originLng, destLat, destLng, radius } = validTrip
+    const res = await fetch(`${BASE}/trips`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${operatorToken}` }, body: JSON.stringify({ origin, destination, product, departure, originLat, originLng, destLat, destLng, radius, assignments }) })
+    expect(res.status).toBe(201)
+    const { id } = await res.json() as any
+    const wagons = await (await fetch(`${BASE}/trips/${id}/wagons`, { headers: { Authorization: `Bearer ${operatorToken}` } })).json() as any[]
+    expect(wagons.map(w => w.wagonId).sort()).toEqual([availableWagons[0].code, availableWagons[1].code].sort())
+    expect(wagons.find(w => w.wagonId === availableWagons[0].code).deviceId).toBe(availableDevices[1].code)
+  })
+
+  it('rejects manual assignments that pick the same wagon twice', async () => {
+    const availableWagons = await (await fetch(`${BASE}/wagons/available`, { headers: { Authorization: `Bearer ${operatorToken}` } })).json() as any[]
+    const availableDevices = await (await fetch(`${BASE}/devices/available`, { headers: { Authorization: `Bearer ${operatorToken}` } })).json() as any[]
+    const { origin, destination, product, departure, originLat, originLng, destLat, destLng, radius } = validTrip
+    const assignments = [
+      { wagonId: availableWagons[0].id, deviceId: availableDevices[0].id },
+      { wagonId: availableWagons[0].id, deviceId: availableDevices[1].id }
+    ]
+    const res = await fetch(`${BASE}/trips`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${operatorToken}` }, body: JSON.stringify({ origin, destination, product, departure, originLat, originLng, destLat, destLng, radius, assignments }) })
+    expect(res.status).toBe(400)
+    const body = await res.json() as any
+    expect(body.message).toMatch(/seleccionado más de una vez/)
+  })
 })
 
 describe('alerts', () => {

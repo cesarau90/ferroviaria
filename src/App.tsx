@@ -277,10 +277,26 @@ function TripForm({onClose,done}:{onClose:()=>void;done:()=>void}){
   const minDeparture=useMemo(()=>{const d=new Date();d.setSeconds(0,0);return d.toISOString().slice(0,16)},[])
   const [departure,setDeparture]=useState(()=>{const d=new Date(Date.now()+3600000);d.setSeconds(0,0);return d.toISOString().slice(0,16)})
   const [radius,setRadius]=useState('1500')
-  const [wagonCount,setWagonCount]=useState('5')
+  const [pool,setPool]=useState<{wagons:{id:number;code:string}[];devices:{id:number;code:string}[]}>()
+  const [picks,setPicks]=useState<Record<number,number>>({})
   const [fieldErrors,setFieldErrors]=useState<Record<string,string>>({})
   const [error,setError]=useState('')
   const [busy,setBusy]=useState(false)
+  useEffect(()=>{
+    Promise.all([request<{id:number;code:string}[]>('/wagons/available'),request<{id:number;code:string}[]>('/devices/available')])
+      .then(([wagons,devices])=>setPool({wagons,devices}))
+      .catch(()=>{})
+  },[])
+  const toggleWagon=(wagonId:number)=>setPicks(p=>{
+    if(wagonId in p){const rest={...p};delete rest[wagonId];return rest}
+    const usedDevices=new Set(Object.values(p))
+    const matching=pool?.devices.find(d=>d.id===wagonId && !usedDevices.has(d.id))
+    const fallback=pool?.devices.find(d=>!usedDevices.has(d.id))
+    const deviceId=(matching||fallback)?.id
+    if(deviceId===undefined) return p
+    return {...p,[wagonId]:deviceId}
+  })
+  const setDeviceFor=(wagonId:number,deviceId:number)=>setPicks(p=>({...p,[wagonId]:deviceId}))
   const validate=()=>{
     const errs:Record<string,string>={}
     if(!originPlace || originPlace.label!==origin) errs.origin='Selecciona el origen desde las sugerencias.'
@@ -290,8 +306,7 @@ function TripForm({onClose,done}:{onClose:()=>void;done:()=>void}){
     else if(departure<minDeparture) errs.departure='La salida no puede ser anterior al momento actual.'
     const radiusValue=Number(radius)
     if(!radius || !Number.isFinite(radiusValue) || radiusValue<=0) errs.radius='El radio debe ser un número positivo.'
-    const wagonValue=Number(wagonCount)
-    if(!wagonCount || !Number.isInteger(wagonValue) || wagonValue<1) errs.wagonCount='Indica una cantidad entera de al menos 1.'
+    if(Object.keys(picks).length<1) errs.wagons='Selecciona al menos un vagón con su dispositivo.'
     setFieldErrors(errs)
     return Object.keys(errs).length===0
   }
@@ -300,13 +315,14 @@ function TripForm({onClose,done}:{onClose:()=>void;done:()=>void}){
     if(!validate() || !originPlace || !destPlace) return
     setBusy(true)
     try{
-      await request('/trips',{method:'POST',body:JSON.stringify({origin:originPlace.label,destination:destPlace.label,product,departure,originLat:originPlace.lat,originLng:originPlace.lng,destLat:destPlace.lat,destLng:destPlace.lng,radius:Number(radius),wagonCount:Number(wagonCount)})})
+      const assignments=Object.entries(picks).map(([wagonId,deviceId])=>({wagonId:Number(wagonId),deviceId}))
+      await request('/trips',{method:'POST',body:JSON.stringify({origin:originPlace.label,destination:destPlace.label,product,departure,originLat:originPlace.lat,originLng:originPlace.lng,destLat:destPlace.lat,destLng:destPlace.lng,radius:Number(radius),assignments})})
       done()
     }catch(e){setError((e as Error).message)}
     finally{setBusy(false)}
   }
   return <div className="fixed inset-0 z-30 grid place-items-center bg-black/70 p-4"><form onSubmit={submit} noValidate className="panel max-h-[90vh] w-full max-w-2xl overflow-auto p-6">
-    <div className="mb-5 flex justify-between"><div><h2 className="text-xl font-bold">Crear viaje</h2><p className="text-sm text-slate-400">Busca el origen y destino; vagones y dispositivos disponibles se asociarán automáticamente.</p></div><button type="button" onClick={onClose}><X/></button></div>
+    <div className="mb-5 flex justify-between"><div><h2 className="text-xl font-bold">Crear viaje</h2><p className="text-sm text-slate-400">Busca el origen y destino, y elige qué vagones y dispositivos asignar.</p></div><button type="button" onClick={onClose}><X/></button></div>
     <div className="grid gap-4 sm:grid-cols-2">
       <LocationField label="Origen" placeholder="Ej. Tampico" value={origin} onChange={v=>{setOrigin(v);setOriginPlace(null)}} onSelect={p=>{setOrigin(p.label);setOriginPlace(p)}} error={fieldErrors.origin}/>
       <LocationField label="Destino" placeholder="Ej. Monterrey" value={destination} onChange={v=>{setDestination(v);setDestPlace(null)}} onSelect={p=>{setDestination(p.label);setDestPlace(p)}} error={fieldErrors.destination}/>
@@ -317,12 +333,37 @@ function TripForm({onClose,done}:{onClose:()=>void;done:()=>void}){
       <label className="label">Latitud destino<input className="input normal-case tracking-normal cursor-not-allowed text-slate-400" value={destPlace?destPlace.lat.toFixed(4):''} readOnly placeholder="Se completa al elegir el destino"/></label>
       <label className="label">Longitud destino<input className="input normal-case tracking-normal cursor-not-allowed text-slate-400" value={destPlace?destPlace.lng.toFixed(4):''} readOnly placeholder="Se completa al elegir el destino"/></label>
       <label className="label">Radio geocerca (m)<input className="input normal-case tracking-normal" type="number" min={1} step={1} value={radius} onChange={e=>setRadius(e.target.value)} placeholder="1500"/>{fieldErrors.radius && <p className="mt-1 text-xs font-normal normal-case tracking-normal text-red-300">{fieldErrors.radius}</p>}</label>
-      <label className="label">Cantidad de vagones<input className="input normal-case tracking-normal" type="number" min={1} step={1} value={wagonCount} onChange={e=>setWagonCount(e.target.value)} placeholder="5"/>{fieldErrors.wagonCount && <p className="mt-1 text-xs font-normal normal-case tracking-normal text-red-300">{fieldErrors.wagonCount}</p>}</label>
     </div>
+    <div className="mt-4"><WagonAssignment pool={pool} picks={picks} onToggle={toggleWagon} onDevice={setDeviceFor} error={fieldErrors.wagons}/></div>
     {originPlace && destPlace && <div className="mt-4 h-40 overflow-hidden rounded-xl panel p-1"><MapContainer key={`${originPlace.lat},${originPlace.lng}-${destPlace.lat},${destPlace.lng}`} bounds={[[originPlace.lat,originPlace.lng],[destPlace.lat,destPlace.lng]]} boundsOptions={{padding:[24,24]}} scrollWheelZoom={false} dragging={false} zoomControl={false} doubleClickZoom={false} touchZoom={false} className="z-0"><TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"/><Polyline positions={[[originPlace.lat,originPlace.lng],[destPlace.lat,destPlace.lng]]} pathOptions={{color:'#22d3ee',weight:3,dashArray:'8 8'}}/><CircleMarker center={[originPlace.lat,originPlace.lng]} radius={7} pathOptions={{color:'#38bdf8',fillColor:'#38bdf8',fillOpacity:1}}/><CircleMarker center={[destPlace.lat,destPlace.lng]} radius={7} pathOptions={{color:'#34d399',fillColor:'#34d399',fillOpacity:1}}/></MapContainer></div>}
+    {Object.keys(picks).length>0 && <p className="mt-4 text-xs text-slate-400">Vas a crear un viaje con <b className="text-slate-200">{Object.keys(picks).length}</b> {Object.keys(picks).length===1?'vagón':'vagones'}.</p>}
     {error && <p className="mt-4 text-sm text-red-300">{error}</p>}
     <div className="mt-6 flex justify-end gap-3"><button type="button" className="btn-muted" onClick={onClose} disabled={busy}>Cancelar</button><button className="btn-primary" disabled={busy}>{busy?'Creando…':'Crear viaje'}</button></div>
   </form></div>
+}
+function WagonAssignment({pool,picks,onToggle,onDevice,error}:{pool?:{wagons:{id:number;code:string}[];devices:{id:number;code:string}[]};picks:Record<number,number>;onToggle:(wagonId:number)=>void;onDevice:(wagonId:number,deviceId:number)=>void;error?:string}){
+  if(!pool) return <p className="text-xs text-slate-500">Cargando vagones disponibles…</p>
+  if(pool.wagons.length===0) return <p className="text-xs text-amber-300">No hay vagones disponibles en este momento.</p>
+  const count=Object.keys(picks).length
+  return <div>
+    <div className="mb-2 flex items-center justify-between"><p className="label">Vagones y dispositivos disponibles</p><span className="text-xs text-slate-400">{count} seleccionado{count===1?'':'s'}</span></div>
+    <div className="max-h-56 space-y-1.5 overflow-auto rounded-lg border border-slate-800 p-2">
+      {pool.wagons.map(w=>{
+        const checked=w.id in picks
+        const usedByOthers=new Set(Object.entries(picks).filter(([wid])=>Number(wid)!==w.id).map(([,did])=>did))
+        const options=pool.devices.filter(d=>!usedByOthers.has(d.id))
+        return <div key={w.id} className="flex items-center gap-2 rounded-lg bg-slate-900/60 px-2.5 py-1.5">
+          <input type="checkbox" checked={checked} onChange={()=>onToggle(w.id)} className="h-4 w-4 accent-cyan-400"/>
+          <span className="w-20 shrink-0 text-sm font-semibold text-slate-200">{w.code}</span>
+          <select disabled={!checked} value={picks[w.id]||''} onChange={e=>onDevice(w.id,Number(e.target.value))} className="input flex-1 py-1.5 text-xs normal-case tracking-normal disabled:opacity-40">
+            <option value="" disabled>Selecciona dispositivo</option>
+            {options.map(d=><option key={d.id} value={d.id}>{d.code}</option>)}
+          </select>
+        </div>
+      })}
+    </div>
+    {error && <p className="mt-1 text-xs font-normal normal-case tracking-normal text-red-300">{error}</p>}
+  </div>
 }
 function ControlCenter({user}:{user:User}){
   const {id}=useParams()
