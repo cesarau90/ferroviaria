@@ -81,6 +81,14 @@ function alertFor(tripId: number, twId: number, type: string, severity: string, 
   io.emit('alert:new', a); audit(null, type, tripId, twId, 'ALERT', description)
 }
 function resolveAlert(twId: number, type: string) { db.prepare("UPDATE alerts SET status='RESOLVED' WHERE trip_wagon_id=? AND type=? AND status IN ('ACTIVE','ACKNOWLEDGED')").run(twId, type) }
+// Unlike alertFor(), this always inserts a new row instead of suppressing
+// duplicates — each unauthorized unlock attempt is a distinct point-in-time
+// event worth its own entry, not an ongoing condition to collapse into one.
+function alertEvent(tripId: number, twId: number, type: string, severity: string, description: string) {
+  const result = db.prepare('INSERT INTO alerts (trip_id,trip_wagon_id,type,severity,description,status,created_at) VALUES (?,?,?,?,?,?,?)').run(tripId, twId, type, severity, description, 'ACTIVE', iso())
+  const a = db.prepare('SELECT * FROM alerts WHERE id=?').get(result.lastInsertRowid)
+  io.emit('alert:new', a)
+}
 function evaluate(w: Wagon) {
   if (w.battery < 20) alertFor(w.trip_id, w.id, 'LOW_BATTERY', 'WARNING', `${w.wagon_code}: batería crítica (${w.battery}%)`); else resolveAlert(w.id, 'LOW_BATTERY')
   if (!w.online) alertFor(w.trip_id, w.id, 'DEVICE_OFFLINE', 'CRITICAL', `${w.wagon_code}: dispositivo sin comunicación`); else resolveAlert(w.id, 'DEVICE_OFFLINE')
@@ -242,16 +250,16 @@ function unlockChecks(w: Wagon, user: UserToken) {
   if (w.tamper || db.prepare("SELECT id FROM alerts WHERE trip_wagon_id=? AND type='TAMPER_DETECTED' AND status='ACTIVE'").get(w.id)) errors.push('Existe una alerta crítica de manipulación activa.')
   return errors
 }
-app.post('/api/wagons/:id/request-unlock', token, (req,res) => { const w = wagonRow(Number(req.params.id)), user=(req as any).user as UserToken; if(!w) return res.status(404).json({message:'Wagon not found'}); const errors=unlockChecks(w,user); audit(user.id,'UNLOCK_REQUESTED',w.trip_id,w.id,errors.length?'DENIED':'PENDING',errors.join(' ')); if(errors.length) { io.emit('audit:new',{action:'UNLOCK_DENIED',wagonId:w.wagon_code,reason:errors.join(' ')}); return res.status(400).json({authorized:false,errors}) } const unlockToken=`req_${crypto.randomUUID()}`; db.prepare('INSERT INTO unlock_requests (token,trip_wagon_id,user_id,created_at) VALUES (?,?,?,?)').run(unlockToken,w.id,user.id,iso()); res.json({authorized:true,unlockToken,wagonId:w.wagon_code,tripCode:w.trip_code,location:'Zona autorizada'}) })
+app.post('/api/wagons/:id/request-unlock', token, (req,res) => { const w = wagonRow(Number(req.params.id)), user=(req as any).user as UserToken; if(!w) return res.status(404).json({message:'Wagon not found'}); const errors=unlockChecks(w,user); audit(user.id,'UNLOCK_REQUESTED',w.trip_id,w.id,errors.length?'DENIED':'PENDING',errors.join(' ')); if(errors.length) { io.emit('audit:new',{action:'UNLOCK_DENIED',wagonId:w.wagon_code,reason:errors.join(' ')}); alertEvent(w.trip_id,w.id,'UNAUTHORIZED_ATTEMPT','CRITICAL',`${w.wagon_code}: intento de desbloqueo no autorizado (${errors.join(' ')})`); return res.status(400).json({authorized:false,errors}) } const unlockToken=`req_${crypto.randomUUID()}`; db.prepare('INSERT INTO unlock_requests (token,trip_wagon_id,user_id,created_at) VALUES (?,?,?,?)').run(unlockToken,w.id,user.id,iso()); res.json({authorized:true,unlockToken,wagonId:w.wagon_code,tripCode:w.trip_code,location:'Zona autorizada'}) })
 const UNLOCK_TOKEN_TTL_MS = 5 * 60 * 1000
 app.post('/api/wagons/:id/confirm-unlock', token, (req,res) => {
   const { unlockToken, code } = req.body || {}, user=(req as any).user as UserToken, w=wagonRow(Number(req.params.id)); if(!w) return res.status(404).json({message:'Wagon not found'})
   const request = db.prepare('SELECT * FROM unlock_requests WHERE token=? AND trip_wagon_id=? AND user_id=?').get(unlockToken,w.id,user.id) as any
-  if(!request) { audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED','Unlock token not found or already used'); return res.status(400).json({message:'La solicitud de desbloqueo no existe o ya fue utilizada.'}) }
+  if(!request) { audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED','Unlock token not found or already used'); alertEvent(w.trip_id,w.id,'UNAUTHORIZED_ATTEMPT','CRITICAL',`${w.wagon_code}: intento de confirmar desbloqueo con una solicitud inexistente o ya usada`); return res.status(400).json({message:'La solicitud de desbloqueo no existe o ya fue utilizada.'}) }
   if(Date.now()-new Date(request.created_at).getTime()>UNLOCK_TOKEN_TTL_MS) { db.prepare('DELETE FROM unlock_requests WHERE id=?').run(request.id); audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED','Unlock token expired'); return res.status(400).json({message:'La solicitud de desbloqueo expiró. Solicita un nuevo desbloqueo.'}) }
   // DEMO ONLY - Replace with real MFA/TOTP provider in production.
-  if(code !== '123456') { audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED','MFA demo code invalid'); return res.status(400).json({message:'Código de segundo factor inválido.'}) }
-  const errors = unlockChecks(w,user); if(errors.length) { audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED',errors.join(' ')); return res.status(400).json({message:'Las condiciones de seguridad cambiaron.',errors}) }
+  if(code !== '123456') { audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED','MFA demo code invalid'); alertEvent(w.trip_id,w.id,'UNAUTHORIZED_ATTEMPT','CRITICAL',`${w.wagon_code}: código de segundo factor inválido al intentar desbloquear`); return res.status(400).json({message:'Código de segundo factor inválido.'}) }
+  const errors = unlockChecks(w,user); if(errors.length) { audit(user.id,'UNLOCK_DENIED',w.trip_id,w.id,'DENIED',errors.join(' ')); alertEvent(w.trip_id,w.id,'UNAUTHORIZED_ATTEMPT','CRITICAL',`${w.wagon_code}: condiciones de seguridad cambiaron durante el intento de desbloqueo (${errors.join(' ')})`); return res.status(400).json({message:'Las condiciones de seguridad cambiaron.',errors}) }
   db.prepare("UPDATE trip_wagons SET lock_status='UNLOCKED' WHERE id=?").run(w.id); db.prepare('DELETE FROM unlock_requests WHERE id=?').run(request.id); audit(user.id,'UNLOCK_AUTHORIZED',w.trip_id,w.id,'SUCCESS','Unlock authorized by MFA'); const updated=wagonData(wagonRow(w.id)!); io.emit('wagon:status',updated); io.emit('unlock:status',{wagonId:w.id,status:'UNLOCKED'}); res.json({ok:true,wagon:updated})
 })
 app.get('/api/alerts', token, (_req,res) => res.json(db.prepare(`SELECT a.*,w.code wagon_code,d.code device_code,t.code trip_code FROM alerts a LEFT JOIN trip_wagons tw ON tw.id=a.trip_wagon_id LEFT JOIN wagons w ON w.id=tw.wagon_id LEFT JOIN devices d ON d.id=tw.device_id LEFT JOIN trips t ON t.id=a.trip_id ORDER BY a.id DESC LIMIT 100`).all()))
