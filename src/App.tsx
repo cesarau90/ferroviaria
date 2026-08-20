@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom'
 import { io } from 'socket.io-client'
-import { Activity, AlertTriangle, Bell, BookOpen, Box, ChevronRight, CircleDot, Cpu, Gauge, ListFilter, Lock, LogOut, Map as MapIcon, MapPin, Play, Plus, Radio, ShieldCheck, SlidersHorizontal, Train, Unlock, Users, Wifi, X } from 'lucide-react'
+import { Activity, AlertTriangle, Bell, BookOpen, Box, Calendar, ChevronRight, CircleDot, Cpu, Gauge, ListFilter, Lock, LogOut, Map as MapIcon, MapPin, Play, Plus, Radio, ShieldCheck, SlidersHorizontal, Train, Unlock, Users, Wifi, X } from 'lucide-react'
 import { Circle, CircleMarker, MapContainer, Polyline, TileLayer } from 'react-leaflet'
 import { auth, request, User } from './api'
 
@@ -59,6 +59,60 @@ function LocationField({label,placeholder,value,onChange,onSelect,error}:{label:
     </ul>}
   </div>
 }
+function DateTimeField({label,value,onChange,min,error}:{label:string;value:string;onChange:(v:string)=>void;min:string;error?:string}){
+  const [open,setOpen]=useState(false)
+  const boxRef=useRef<HTMLDivElement>(null)
+  const [datePart,timePart]=value.split('T')
+  const minDate=min.split('T')[0]
+  const pad=(n:number)=>String(n).padStart(2,'0')
+  const seed=datePart?new Date(`${datePart}T00:00`):new Date()
+  const [viewYear,setViewYear]=useState(seed.getFullYear())
+  const [viewMonth,setViewMonth]=useState(seed.getMonth())
+  useEffect(()=>{
+    const onClick=(e:MouseEvent)=>{if(boxRef.current && !boxRef.current.contains(e.target as Node))setOpen(false)}
+    document.addEventListener('mousedown',onClick)
+    return ()=>document.removeEventListener('mousedown',onClick)
+  },[])
+  const goMonth=(delta:number)=>{const d=new Date(viewYear,viewMonth+delta,1);setViewYear(d.getFullYear());setViewMonth(d.getMonth())}
+  const pickDay=(day:number)=>onChange(`${viewYear}-${pad(viewMonth+1)}-${pad(day)}T${timePart||'08:00'}`)
+  const pickTime=(t:string)=>{if(datePart)onChange(`${datePart}T${t}`)}
+  const daysCount=new Date(viewYear,viewMonth+1,0).getDate()
+  const offset=(new Date(viewYear,viewMonth,1).getDay()+6)%7
+  const cells=[...Array(offset).fill(null),...Array.from({length:daysCount},(_,i)=>i+1)]
+  const rawMonthLabel=new Intl.DateTimeFormat('es-MX',{month:'long',year:'numeric'}).format(new Date(viewYear,viewMonth,1))
+  const monthLabel=rawMonthLabel.charAt(0).toUpperCase()+rawMonthLabel.slice(1)
+  const display=datePart?new Intl.DateTimeFormat('es-MX',{dateStyle:'long',timeStyle:'short'}).format(new Date(`${datePart}T${timePart||'00:00'}`)):'Selecciona fecha y hora'
+  return <div ref={boxRef} className="relative">
+    <label className="label">{label}
+      <button type="button" onClick={()=>setOpen(o=>!o)} className="input flex w-full items-center justify-between normal-case tracking-normal text-left">
+        <span className={datePart?'':'text-slate-500'}>{display}</span>
+        <Calendar size={16} className="text-slate-500"/>
+      </button>
+    </label>
+    {error && <p className="mt-1 text-xs font-normal normal-case tracking-normal text-red-300">{error}</p>}
+    {open && <div className="panel absolute z-10 mt-1 w-72 bg-slate-900 p-3 shadow-xl">
+      <div className="flex items-center justify-between">
+        <button type="button" className="rounded p-1 text-slate-400 hover:bg-slate-800" onClick={()=>goMonth(-1)}><ChevronRight size={16} className="rotate-180"/></button>
+        <p className="text-sm font-semibold">{monthLabel}</p>
+        <button type="button" className="rounded p-1 text-slate-400 hover:bg-slate-800" onClick={()=>goMonth(1)}><ChevronRight size={16}/></button>
+      </div>
+      <div className="mt-3 grid grid-cols-7 gap-1 text-center text-[10px] uppercase tracking-wider text-slate-500">{['L','M','M','J','V','S','D'].map((d,i)=><span key={i}>{d}</span>)}</div>
+      <div className="mt-1 grid grid-cols-7 gap-1">
+        {cells.map((day,i)=>{
+          if(day===null) return <span key={i}/>
+          const iso=`${viewYear}-${pad(viewMonth+1)}-${pad(day)}`
+          const disabled=iso<minDate
+          const selected=iso===datePart
+          return <button key={i} type="button" disabled={disabled} onClick={()=>pickDay(day)} className={`rounded-lg py-1.5 text-xs ${selected?'bg-cyan-400 font-bold text-slate-950':disabled?'cursor-not-allowed text-slate-700':'text-slate-200 hover:bg-slate-800'}`}>{day}</button>
+        })}
+      </div>
+      <label className="label mt-4 block">Hora
+        <input type="time" className="input normal-case tracking-normal" value={timePart||''} min={datePart===minDate?min.split('T')[1]:undefined} onChange={e=>pickTime(e.target.value)}/>
+      </label>
+      <button type="button" className="btn-primary mt-3 w-full" onClick={()=>setOpen(false)}>Listo</button>
+    </div>}
+  </div>
+}
 function TripForm({onClose,done}:{onClose:()=>void;done:()=>void}){
   const [origin,setOrigin]=useState('')
   const [originPlace,setOriginPlace]=useState<Place|null>(null)
@@ -102,7 +156,7 @@ function TripForm({onClose,done}:{onClose:()=>void;done:()=>void}){
       <LocationField label="Origen" placeholder="Ej. Tampico" value={origin} onChange={v=>{setOrigin(v);setOriginPlace(null)}} onSelect={p=>{setOrigin(p.label);setOriginPlace(p)}} error={fieldErrors.origin}/>
       <LocationField label="Destino" placeholder="Ej. Monterrey" value={destination} onChange={v=>{setDestination(v);setDestPlace(null)}} onSelect={p=>{setDestination(p.label);setDestPlace(p)}} error={fieldErrors.destination}/>
       <label className="label">Producto<input className="input normal-case tracking-normal" value={product} onChange={e=>setProduct(e.target.value)} placeholder="Pellet"/>{fieldErrors.product && <p className="mt-1 text-xs font-normal normal-case tracking-normal text-red-300">{fieldErrors.product}</p>}</label>
-      <label className="label">Salida<input className="input normal-case tracking-normal" type="datetime-local" min={minDeparture} value={departure} onChange={e=>setDeparture(e.target.value)}/>{fieldErrors.departure && <p className="mt-1 text-xs font-normal normal-case tracking-normal text-red-300">{fieldErrors.departure}</p>}</label>
+      <DateTimeField label="Salida" value={departure} onChange={setDeparture} min={minDeparture} error={fieldErrors.departure}/>
       <label className="label">Latitud origen<input className="input normal-case tracking-normal cursor-not-allowed text-slate-400" value={originPlace?originPlace.lat.toFixed(4):''} readOnly placeholder="Se completa al elegir el origen"/></label>
       <label className="label">Longitud origen<input className="input normal-case tracking-normal cursor-not-allowed text-slate-400" value={originPlace?originPlace.lng.toFixed(4):''} readOnly placeholder="Se completa al elegir el origen"/></label>
       <label className="label">Latitud destino<input className="input normal-case tracking-normal cursor-not-allowed text-slate-400" value={destPlace?destPlace.lat.toFixed(4):''} readOnly placeholder="Se completa al elegir el destino"/></label>
