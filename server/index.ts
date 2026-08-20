@@ -213,6 +213,7 @@ app.delete('/api/trips/:id', token, allow('ADMIN','OPERATOR'), (req,res) => {
   const trip = db.prepare('SELECT * FROM trips WHERE id=?').get(tripId) as any
   if (!trip) return res.status(404).json({ message: 'Trip not found' })
   if (trip.status !== 'PLANNED') return res.status(400).json({ message: 'Solo se pueden eliminar viajes que aún no han iniciado.' })
+  if (db.prepare("SELECT 1 FROM audit_logs WHERE trip_id=? AND action IN ('TRIP_STARTED','TRIP_RESET') LIMIT 1").get(tripId)) return res.status(400).json({ message: 'Este viaje ya tiene historial real (se inició o reinició antes); no se puede eliminar.' })
   db.exec('BEGIN')
   try {
     const tripWagonIds = (db.prepare('SELECT id FROM trip_wagons WHERE trip_id=?').all(tripId) as any[]).map(r => r.id)
@@ -248,7 +249,7 @@ app.post('/api/trips/:id/reset', token, allow('ADMIN','OPERATOR'), (req,res) => 
   const tripId=Number(req.params.id); const trip=db.prepare('SELECT * FROM trips WHERE id=?').get(tripId) as any
   if(!trip) return res.status(404).json({message:'Trip not found'})
   if(trip.status!=='ARRIVED') return res.status(400).json({message:'Solo se pueden reiniciar viajes que ya arribaron.'})
-  db.prepare("UPDATE trips SET status='ACTIVE', progress=0 WHERE id=?").run(tripId)
+  db.prepare("UPDATE trips SET status='PLANNED', progress=0 WHERE id=?").run(tripId)
   const wagons=db.prepare('SELECT * FROM trip_wagons WHERE trip_id=?').all(tripId) as any[]
   for(const w of wagons) {
     const offset=(w.wagon_id%5)*.0008
@@ -258,7 +259,7 @@ app.post('/api/trips/:id/reset', token, allow('ADMIN','OPERATOR'), (req,res) => 
   }
   db.prepare("UPDATE alerts SET status='RESOLVED' WHERE trip_id=? AND status IN ('ACTIVE','ACKNOWLEDGED')").run(tripId)
   audit((req as any).user.id,'TRIP_RESET',tripId,null,'SUCCESS','Demostración reiniciada')
-  io.emit('trip:status',{tripId,status:'ACTIVE'}); io.emit('trip:position',{tripId,progress:0,status:'ACTIVE'})
+  io.emit('trip:status',{tripId,status:'PLANNED'}); io.emit('trip:position',{tripId,progress:0,status:'PLANNED'})
   for(const w of wagons) io.emit('wagon:status', wagonData(wagonRow(w.id)!))
   res.json({ok:true})
 })
