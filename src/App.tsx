@@ -72,7 +72,7 @@ function Login({onLogin}:{onLogin:(u:User)=>void}) { const [email,setEmail]=useS
 function Shell({user,onLogout}:{user:User;onLogout:()=>void}) {
   const [count,setCount]=useState(0)
   const [menuOpen,setMenuOpen]=useState(false)
-  useEffect(()=>{request<any[]>('/alerts').then(x=>setCount(x.filter(a=>a.status==='ACTIVE').length)).catch(()=>{}); const f=()=>setCount(x=>x+1);socket.on('alert:new',f);return()=>{socket.off('alert:new',f)}},[])
+  useEffect(()=>{const refresh=()=>request<any[]>('/alerts').then(x=>setCount(x.filter(a=>a.status==='ACTIVE').length)).catch(()=>{}); refresh(); socket.on('alert:new',refresh); socket.on('alert:update',refresh); return()=>{socket.off('alert:new',refresh);socket.off('alert:update',refresh)}},[])
   const navLinks=(onNavigate?:()=>void)=><nav className="space-y-1">{menus.map(([to,Icon,label])=><NavLink key={to} to={to} end={to==='/'} onClick={onNavigate} className={({isActive})=>`flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition ${isActive?'bg-cyan-400 text-slate-950 font-bold':'text-slate-400 hover:bg-slate-900 hover:text-white'}`}><Icon size={18}/>{label}{label==='Alertas'&&count>0&&<span className="ml-auto rounded-full bg-red-500 px-2 py-.5 text-[10px] text-white">{count}</span>}</NavLink>)}</nav>
   return <div className="flex min-h-screen">
     <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 border-r border-slate-800 bg-slate-950 p-4 lg:block">
