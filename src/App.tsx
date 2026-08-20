@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom'
 import { io } from 'socket.io-client'
-import { Activity, AlertTriangle, Bell, BookOpen, Box, Calendar, ChevronRight, CircleDot, Cpu, Gauge, ListFilter, Lock, LogOut, Map as MapIcon, MapPin, Menu, Play, Plus, Radio, RotateCcw, ShieldCheck, SlidersHorizontal, Train, Unlock, Users, Wifi, X } from 'lucide-react'
+import { Activity, AlertTriangle, Bell, BookOpen, Box, Calendar, ChevronRight, CircleDot, Cpu, Gauge, ListFilter, Lock, LogOut, Map as MapIcon, MapPin, Menu, Play, Plus, Radio, RotateCcw, ShieldCheck, SlidersHorizontal, Train, Trash2, Unlock, Users, Wifi, X } from 'lucide-react'
 import { Circle, CircleMarker, MapContainer, Polyline, Popup, TileLayer } from 'react-leaflet'
 import { auth, request, User } from './api'
 
@@ -160,6 +160,14 @@ function Trips({user}:{user:User}){
     catch(err){toast.error((err as Error).message)}
     finally{setBusyId(null)}
   }
+  const deleteTrip=async(e:React.MouseEvent,id:number,code:string)=>{
+    e.preventDefault();e.stopPropagation()
+    if(!window.confirm(`¿Eliminar el viaje ${code}? Esta acción no se puede deshacer.`)) return
+    setBusyId(id)
+    try{await request(`/trips/${id}`,{method:'DELETE'});toast.success('Viaje eliminado.');await load()}
+    catch(err){toast.error((err as Error).message)}
+    finally{setBusyId(null)}
+  }
   return <>
     <PageTitle action={user.role!=='VIEWER'?<button className="btn-primary" onClick={()=>setShow(true)}><Plus size={16}/>Nuevo viaje</button>:undefined}><p className="label">Planificación</p><h1 className="mt-1 text-2xl font-bold">Viajes ferroviarios</h1><p className="mt-1 text-sm text-slate-400">Gestiona rutas, geocercas y composición de convoyes.</p></PageTitle>
     <div className="grid gap-4 xl:grid-cols-2">{trips.map(t=>
@@ -168,6 +176,7 @@ function Trips({user}:{user:User}){
         <div className="mt-5 grid grid-cols-3 gap-3 text-sm"><div><p className="label">Producto</p><p>{t.product}</p></div><div><p className="label">Vagones</p><p>{t.wagon_count}</p></div><div><p className="label">Progreso</p><p>{Math.round(t.progress*100)}%</p></div></div>
         <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-slate-800"><div className="h-full bg-cyan-400" style={{width:`${t.progress*100}%`}}/></div>
         {user.role!=='VIEWER' && (t.status==='PLANNED' || t.status==='ARRIVED') && <div className="mt-4 flex justify-end">
+          {t.status==='PLANNED' && <button onClick={e=>deleteTrip(e,t.id,t.code)} disabled={busyId===t.id} className="btn-muted"><Trash2 size={14}/>Eliminar</button>}
           {t.status==='PLANNED' && <button onClick={e=>startTrip(e,t.id)} disabled={busyId===t.id} className="btn-primary"><Play size={14}/>{busyId===t.id?'Iniciando…':'Iniciar viaje'}</button>}
           {t.status==='ARRIVED' && <button onClick={e=>resetTrip(e,t.id)} disabled={busyId===t.id} className="btn-muted"><RotateCcw size={14}/>{busyId===t.id?'Reiniciando…':'Reiniciar demostración'}</button>}
         </div>}

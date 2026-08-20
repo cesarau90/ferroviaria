@@ -208,6 +208,32 @@ app.post('/api/trips', token, allow('ADMIN', 'OPERATOR'), (req, res) => {
     res.status(500).json({ message: 'No se pudo crear el viaje. Intenta nuevamente.' })
   }
 })
+app.delete('/api/trips/:id', token, allow('ADMIN','OPERATOR'), (req,res) => {
+  const tripId = Number(req.params.id)
+  const trip = db.prepare('SELECT * FROM trips WHERE id=?').get(tripId) as any
+  if (!trip) return res.status(404).json({ message: 'Trip not found' })
+  if (trip.status !== 'PLANNED') return res.status(400).json({ message: 'Solo se pueden eliminar viajes que aún no han iniciado.' })
+  db.exec('BEGIN')
+  try {
+    const tripWagonIds = (db.prepare('SELECT id FROM trip_wagons WHERE trip_id=?').all(tripId) as any[]).map(r => r.id)
+    for (const twId of tripWagonIds) {
+      db.prepare('DELETE FROM unlock_requests WHERE trip_wagon_id=?').run(twId)
+      db.prepare('DELETE FROM telemetry WHERE trip_wagon_id=?').run(twId)
+      db.prepare('DELETE FROM alerts WHERE trip_wagon_id=?').run(twId)
+    }
+    db.prepare('DELETE FROM alerts WHERE trip_id=?').run(tripId)
+    db.prepare('DELETE FROM audit_logs WHERE trip_id=?').run(tripId)
+    db.prepare('DELETE FROM trip_wagons WHERE trip_id=?').run(tripId)
+    db.prepare('DELETE FROM trips WHERE id=?').run(tripId)
+    db.exec('COMMIT')
+  } catch {
+    db.exec('ROLLBACK')
+    return res.status(500).json({ message: 'No se pudo eliminar el viaje.' })
+  }
+  audit((req as any).user.id,'TRIP_DELETED',null,null,'SUCCESS',trip.code)
+  io.emit('trip:status',{ id: tripId, deleted: true })
+  res.json({ ok: true })
+})
 app.get('/api/trips/:id', token, (req,res) => { const tripId=Number(req.params.id); const trip = db.prepare('SELECT * FROM trips WHERE id=?').get(tripId); if (!trip) return res.status(404).json({message:'Trip not found'}); const wagons = db.prepare('SELECT id FROM trip_wagons WHERE trip_id=?').all(tripId).map((x:any) => wagonData(wagonRow(x.id)!)); res.json({ trip, wagons, events: db.prepare('SELECT * FROM audit_logs WHERE trip_id=? ORDER BY id DESC LIMIT 20').all(tripId) }) })
 app.post('/api/trips/:id/start', token, allow('ADMIN','OPERATOR'), (req,res) => {
   const tripId=Number(req.params.id); const trip=db.prepare('SELECT * FROM trips WHERE id=?').get(tripId) as any
