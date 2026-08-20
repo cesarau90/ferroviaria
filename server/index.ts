@@ -78,13 +78,13 @@ function wagonData(w: Wagon) {
   return { id: w.id, wagonId: w.wagon_code, deviceId: w.device_code, tripId: w.trip_id, tripCode: w.trip_code, latitude: w.latitude, longitude: w.longitude, speed: w.speed, battery: w.battery, lockStatus: w.lock_status, doorStatus: w.door_status, tamper: !!w.tamper, online: !!w.online, offRoute: !!w.off_route, lastSeen: w.last_seen, status: critical ? 'CRITICAL' : warning ? 'WARNING' : 'ONLINE', geofence: geofence ? 'INSIDE_GEOFENCE' : 'OUTSIDE_GEOFENCE' }
 }
 function alertFor(tripId: number, twId: number, type: string, severity: string, description: string) {
-  const active = db.prepare("SELECT id FROM alerts WHERE trip_wagon_id=? AND type=? AND status='ACTIVE'").get(twId, type)
-  if (active) return
+  const open = db.prepare("SELECT id FROM alerts WHERE trip_wagon_id=? AND type=? AND status IN ('ACTIVE','ACKNOWLEDGED')").get(twId, type)
+  if (open) return
   const result = db.prepare('INSERT INTO alerts (trip_id,trip_wagon_id,type,severity,description,status,created_at) VALUES (?,?,?,?,?,?,?)').run(tripId, twId, type, severity, description, 'ACTIVE', iso())
   const a = db.prepare('SELECT * FROM alerts WHERE id=?').get(result.lastInsertRowid)
   io.emit('alert:new', a); audit(null, type, tripId, twId, 'ALERT', description)
 }
-function resolveAlert(twId: number, type: string) { db.prepare("UPDATE alerts SET status='RESOLVED' WHERE trip_wagon_id=? AND type=? AND status='ACTIVE'").run(twId, type) }
+function resolveAlert(twId: number, type: string) { db.prepare("UPDATE alerts SET status='RESOLVED' WHERE trip_wagon_id=? AND type=? AND status IN ('ACTIVE','ACKNOWLEDGED')").run(twId, type) }
 function evaluate(w: Wagon) {
   if (w.battery < 20) alertFor(w.trip_id, w.id, 'LOW_BATTERY', 'WARNING', `${w.wagon_code}: batería crítica (${w.battery}%)`); else resolveAlert(w.id, 'LOW_BATTERY')
   if (!w.online) alertFor(w.trip_id, w.id, 'DEVICE_OFFLINE', 'CRITICAL', `${w.wagon_code}: dispositivo sin comunicación`); else resolveAlert(w.id, 'DEVICE_OFFLINE')
@@ -117,7 +117,20 @@ app.get('/api/geocode', token, async (req, res) => {
 app.get('/api/dashboard', token, (_req, res) => {
   const wagons = db.prepare("SELECT tw.*,t.dest_lat,t.dest_lng,t.geofence_radius FROM trip_wagons tw JOIN trips t ON t.id=tw.trip_id WHERE t.status='ACTIVE'").all() as Wagon[]
   const activeAlerts = (db.prepare("SELECT count(*) c FROM alerts WHERE status='ACTIVE'").get() as any).c
-  res.json({ stats: { activeTrips: (db.prepare("SELECT count(*) c FROM trips WHERE status='ACTIVE'").get() as any).c, monitoredWagons: wagons.length, activeAlerts, offline: wagons.filter(x => !x.online).length, lowBattery: wagons.filter(x => x.battery < 20).length }, recentTrips: db.prepare('SELECT t.*,count(tw.id) wagon_count FROM trips t LEFT JOIN trip_wagons tw ON tw.trip_id=t.id GROUP BY t.id ORDER BY t.id DESC').all() })
+  const totalWagons = (db.prepare('SELECT count(*) c FROM trip_wagons').get() as any).c
+  res.json({
+    stats: {
+      activeTrips: (db.prepare("SELECT count(*) c FROM trips WHERE status='ACTIVE'").get() as any).c,
+      plannedTrips: (db.prepare("SELECT count(*) c FROM trips WHERE status='PLANNED'").get() as any).c,
+      arrivedTrips: (db.prepare("SELECT count(*) c FROM trips WHERE status='ARRIVED'").get() as any).c,
+      monitoredWagons: wagons.length,
+      totalWagons,
+      activeAlerts,
+      offline: wagons.filter(x => !x.online).length,
+      lowBattery: wagons.filter(x => x.battery < 20).length
+    },
+    recentTrips: db.prepare('SELECT t.*,count(tw.id) wagon_count FROM trips t LEFT JOIN trip_wagons tw ON tw.trip_id=t.id GROUP BY t.id ORDER BY t.id DESC').all()
+  })
 })
 app.get('/api/trips', token, (_req, res) => res.json(db.prepare('SELECT t.*,count(tw.id) wagon_count FROM trips t LEFT JOIN trip_wagons tw ON tw.trip_id=t.id GROUP BY t.id ORDER BY t.id DESC').all()))
 app.post('/api/trips', token, allow('ADMIN', 'OPERATOR'), (req, res) => {
@@ -142,7 +155,33 @@ app.post('/api/trips', token, allow('ADMIN', 'OPERATOR'), (req, res) => {
   audit((req as any).user.id,'TRIP_CREATED',Number(trip.lastInsertRowid),null,'SUCCESS'); res.status(201).json({ id: trip.lastInsertRowid })
 })
 app.get('/api/trips/:id', token, (req,res) => { const tripId=Number(req.params.id); const trip = db.prepare('SELECT * FROM trips WHERE id=?').get(tripId); if (!trip) return res.status(404).json({message:'Trip not found'}); const wagons = db.prepare('SELECT id FROM trip_wagons WHERE trip_id=?').all(tripId).map((x:any) => wagonData(wagonRow(x.id)!)); res.json({ trip, wagons, events: db.prepare('SELECT * FROM audit_logs WHERE trip_id=? ORDER BY id DESC LIMIT 20').all(tripId) }) })
-app.post('/api/trips/:id/start', token, allow('ADMIN','OPERATOR'), (req,res) => { const tripId=Number(req.params.id); db.prepare("UPDATE trips SET status='ACTIVE' WHERE id=?").run(tripId); audit((req as any).user.id,'TRIP_STARTED',tripId,null,'SUCCESS'); io.emit('trip:status',{tripId,status:'ACTIVE'}); res.json({ok:true}) })
+app.post('/api/trips/:id/start', token, allow('ADMIN','OPERATOR'), (req,res) => {
+  const tripId=Number(req.params.id); const trip=db.prepare('SELECT * FROM trips WHERE id=?').get(tripId) as any
+  if(!trip) return res.status(404).json({message:'Trip not found'})
+  if(trip.status!=='PLANNED') return res.status(400).json({message:'Solo se pueden iniciar viajes planificados.'})
+  db.prepare("UPDATE trips SET status='ACTIVE' WHERE id=?").run(tripId)
+  audit((req as any).user.id,'TRIP_STARTED',tripId,null,'SUCCESS')
+  io.emit('trip:status',{tripId,status:'ACTIVE'}); io.emit('trip:position',{tripId,progress:trip.progress,status:'ACTIVE'})
+  res.json({ok:true})
+})
+app.post('/api/trips/:id/reset', token, allow('ADMIN','OPERATOR'), (req,res) => {
+  const tripId=Number(req.params.id); const trip=db.prepare('SELECT * FROM trips WHERE id=?').get(tripId) as any
+  if(!trip) return res.status(404).json({message:'Trip not found'})
+  if(trip.status!=='ARRIVED') return res.status(400).json({message:'Solo se pueden reiniciar viajes que ya arribaron.'})
+  db.prepare("UPDATE trips SET status='ACTIVE', progress=0 WHERE id=?").run(tripId)
+  const wagons=db.prepare('SELECT * FROM trip_wagons WHERE trip_id=?').all(tripId) as any[]
+  for(const w of wagons) {
+    const offset=(w.wagon_id%5)*.0008
+    db.prepare("UPDATE trip_wagons SET latitude=?,longitude=?,speed=0,battery=90,lock_status='LOCKED',door_status='CLOSED',tamper=0,online=1,off_route=0,last_seen=? WHERE id=?")
+      .run(trip.origin_lat+offset, trip.origin_lng-offset, iso(), w.id)
+    db.prepare('DELETE FROM unlock_requests WHERE trip_wagon_id=?').run(w.id)
+  }
+  db.prepare("UPDATE alerts SET status='RESOLVED' WHERE trip_id=? AND status IN ('ACTIVE','ACKNOWLEDGED')").run(tripId)
+  audit((req as any).user.id,'TRIP_RESET',tripId,null,'SUCCESS','Demostración reiniciada')
+  io.emit('trip:status',{tripId,status:'ACTIVE'}); io.emit('trip:position',{tripId,progress:0,status:'ACTIVE'})
+  for(const w of wagons) io.emit('wagon:status', wagonData(wagonRow(w.id)!))
+  res.json({ok:true})
+})
 app.get('/api/trips/:id/wagons', token, (req,res) => res.json(db.prepare('SELECT id FROM trip_wagons WHERE trip_id=?').all(Number(req.params.id)).map((x:any)=>wagonData(wagonRow(x.id)!))))
 app.get('/api/wagons/:id', token, (req,res) => { const w = wagonRow(Number(req.params.id)); if(!w) return res.status(404).json({message:'Wagon not found'}); res.json({ wagon: wagonData(w), telemetry: db.prepare('SELECT * FROM telemetry WHERE trip_wagon_id=? ORDER BY id DESC LIMIT 30').all(w.id), events: db.prepare('SELECT * FROM audit_logs WHERE trip_wagon_id=? ORDER BY id DESC LIMIT 15').all(w.id) }) })
 app.get('/api/wagons/:id/telemetry', token, (req,res) => res.json(db.prepare('SELECT * FROM telemetry WHERE trip_wagon_id=? ORDER BY id DESC LIMIT 50').all(Number(req.params.id))))
